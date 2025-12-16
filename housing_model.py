@@ -9,6 +9,10 @@ Changes in v4.3:
   * Adding beds increases debt service (construction bonds)
   * Revenue only increases if students actually fill the beds
   * This models the "build it and they may not come" risk correctly
+- CHART FIX: Capacity_Index now indexed to base CAPACITY, not base HEADCOUNT
+  * Old: showed 109 even with no bed changes (confusing)
+  * New: shows 100 when no beds added, >100 when beds added
+  * Also fixes hidden bug where baseline had 14% debt penalty for spare capacity
 - Added capacity cost sensitivity sliders in Advanced section
 - New export columns: Expense_Cap_Factor, Debt_Cap_Factor
 
@@ -568,7 +572,7 @@ def compute_capacity_cost_factors(
     """
     Calculate cost scaling factors when capacity changes.
 
-    Code Review Addition (v4.2): This function addresses the critical gap where
+    Code Review Addition (v4.3): This function addresses the critical gap where
     capacity changes had no impact on costs. In reality:
     - New buildings require bonds (debt service increases)
     - New buildings require maintenance/utilities/staff (operating costs increase)
@@ -577,7 +581,9 @@ def compute_capacity_cost_factors(
     The "build it and they will come" assumption is dangerous for bond covenants.
 
     Args:
-        capacity_index: Capacity index over time (100 = base year)
+        capacity_index: Capacity index over time, where 100 = base year CAPACITY
+            (not occupancy). When haggett_net_beds=0, this equals 100.
+            When beds are added, this exceeds 100.
         expense_sensitivity: What fraction of capacity change affects operating costs.
             Default 0.50 means 10% more capacity → 5% more operating costs.
             Rationale: Some costs are fixed (admin), some scale with capacity.
@@ -824,10 +830,21 @@ def run_model(
         safe_div(occupied_headcount, base_headcount, default=0.0) * BASE_INDEX
     )
 
-    # Calculate capacity index for cost scaling
-    # Code Review Fix (v4.2): Capacity changes now affect costs, not just revenue cap
+    # Calculate base capacity (what capacity is when haggett_net_beds = 0)
+    # This is used as the denominator for capacity_index so that:
+    #   - capacity_index = 100 when no beds are added/removed
+    #   - capacity_index > 100 when beds are added
+    #   - capacity_index < 100 when beds are removed
+    base_capacity = float(
+        RECONCILED_DATA["housing_portfolio"]["totals"]["total_operating_capacity"]["value"]
+        + RECONCILED_DATA["housing_portfolio"]["totals"]["overflow_beds"]["value"]
+    )
+
+    # Calculate capacity index for DISPLAY and COST SCALING
+    # Code Review Fix (v4.3): Now indexed to base CAPACITY, not base HEADCOUNT
+    # This fixes the confusing chart where capacity showed as 109 even with no changes
     capacity_index = (
-        safe_div(capacity_headcount, base_headcount, default=np.nan) * BASE_INDEX
+        safe_div(capacity_headcount, base_capacity, default=np.nan) * BASE_INDEX
     )
 
     # Calculate cost scaling factors for capacity changes
@@ -1656,8 +1673,10 @@ with tabs[0]:
         st.line_chart(occ_df.set_index("year"))
 
     st.caption(
-        "If Beds Filled declines while costs rise, coverage becomes harder to maintain. "
-        "The 100 line represents today's occupancy level."
+        "**Beds Filled**: Students housed relative to today (100 = current occupancy). "
+        "**Bed Capacity**: Physical beds relative to today (100 = current capacity). "
+        "When Beds Filled is below Capacity, you have empty beds. "
+        "Adding capacity without filling it increases costs without revenue."
     )
 
     # -------------------------------------------------------------------------
