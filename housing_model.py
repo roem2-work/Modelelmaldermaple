@@ -1,19 +1,18 @@
 # uw_housing_model.py
 """
 UW HFS Housing Structural Risk Model (Index-Based, Outcome Neutral)
-v2.0 - "Boardroom Dashboard" UI/UX pass
+v3.0 - Boardroom UI refinements + clearer tooltips
 
-What changed vs v1:
-- UI language translated from analyst terms to executive plain-English.
-- Scenario reset button added to encourage safe exploration.
-- Dynamic scenario context box added so users immediately know what they loaded.
-- "About This Model" expander added at top for just-in-time interpretation guidance.
-- Traffic-light metrics implemented using st.metric deltas (native Streamlit, no CSS).
-- Chart titles updated to match executive framing.
-- Low-risk polish: friendlier legends, threshold reference lines, optional debt-peak shading.
+Changes vs v2:
+- Removed st.metric delta (+/-) readouts to reduce cognitive load for exec audiences.
+- Kept “traffic light” meaning using simple status callouts (🟢/🔴) without numeric deltas.
+- Made Enrollment Source Weighting display as an intuitive percent (70%, not 0.70).
+- Rewrote sidebar tooltips to include units + concrete examples across the slider range.
+- Added an “Assumptions at a Glance” expander (low-risk UX improvement).
 
-What did NOT change:
-- The underlying math, indices, and DSCR approximation logic are intentionally retained.
+Math and outcome neutrality:
+- Underlying calculation logic is intentionally unchanged.
+- Defaults remain neutral, debt timing defaults to Flat.
 - No absolute dollars are computed, displayed, or exported.
 
 Run:
@@ -29,14 +28,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Requirement (Code Integrity): set_page_config should be the FIRST Streamlit command.
-# Why: Streamlit requires this for stable layout behavior (and will warn if called later).
+# Requirement (Code Integrity): set_page_config must be the first Streamlit command.
 st.set_page_config(
     page_title="UW HFS Housing Structural Risk Dashboard (Index-Based)",
     layout="wide",
 )
 
-# Altair is included in most Streamlit installs, but we keep a fallback path
+# Altair is included in most Streamlit installs, keep a fallback path
 try:
     import altair as alt
 
@@ -132,7 +130,8 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "rate_escalation_pct": 2.5,
         "expense_inflation_pct": 2.5,
         "national_trend_pct_by_2035": 0,
-        "wa_demand_share": 0.70,
+        # Stored as percent in UI (70 means 70%), converted to 0.70 before the model.
+        "wa_demand_share": 70,
         "behavior_headwind_pct_by_2035": 0,
         "haggett_net_beds": 0,
         "expense_share_pct": int(RECONCILED_DATA["financial_ratios"]["expense_share"]["value"] * 100),
@@ -145,7 +144,7 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "rate_escalation_pct": 3.0,
         "expense_inflation_pct": 4.0,
         "national_trend_pct_by_2035": 0,
-        "wa_demand_share": 0.70,
+        "wa_demand_share": 70,
         "behavior_headwind_pct_by_2035": 0,
         "haggett_net_beds": 0,
         "expense_share_pct": int(RECONCILED_DATA["financial_ratios"]["expense_share"]["value"] * 100),
@@ -158,7 +157,7 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "rate_escalation_pct": 2.5,
         "expense_inflation_pct": 2.5,
         "national_trend_pct_by_2035": -10,
-        "wa_demand_share": 0.70,
+        "wa_demand_share": 70,
         "behavior_headwind_pct_by_2035": 0,
         "haggett_net_beds": 0,
         "expense_share_pct": int(RECONCILED_DATA["financial_ratios"]["expense_share"]["value"] * 100),
@@ -170,8 +169,6 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
     "Custom (Keep Current Settings)": {},
 }
 
-# Requirement (State Management): Dynamic scenario context.
-# Why: Execs need instant confirmation of what assumptions they just loaded.
 SCENARIO_CONTEXT: Dict[str, str] = {
     "Baseline": "Baseline: steady rent and cost growth, flat debt timing, no macro or preference headwinds.",
     "Structural Squeeze": "Structural Squeeze: faster cost growth plus a 2030–2037 debt peak (the cliff).",
@@ -228,12 +225,12 @@ def build_ofm_df() -> pd.DataFrame:
 
 def build_national_index(years, pct_by_2035: float) -> np.ndarray:
     """
-    National/Global HS Grad Trend slider is interpreted as a level change by 2035,
-    relative to 2025, for non-resident demand (macro environment proxy).
+    Non-resident macro proxy is interpreted as a level change by 2035 relative to 2025,
+    then held constant for the rest of the horizon.
 
     Example:
-    -10% means non-resident pipeline index moves from 100 in 2025 to 90 in 2035,
-    then holds at 90 through the remainder of the horizon (no extrapolation).
+    -10% means non-resident pipeline index moves from 100 (2025) to 90 (2035),
+    and stays 90 from 2035 onward.
     """
     prog = linear_progress(years, BASE_YEAR, 2035)
     idx = 100.0 * (1.0 + pct_by_2035 * prog)
@@ -242,8 +239,8 @@ def build_national_index(years, pct_by_2035: float) -> np.ndarray:
 
 def build_behavior_index(years, pct_by_2035: float) -> np.ndarray:
     """
-    Optional, outcome-neutral control: broad behavioral headwind/tailwind on housing demand.
-    Interpreted as a level change by 2035 relative to 2025, then held constant.
+    Preference shift overlay is interpreted as a level change by 2035 relative to 2025,
+    then held constant.
     """
     prog = linear_progress(years, BASE_YEAR, 2035)
     idx = 100.0 * (1.0 + pct_by_2035 * prog)
@@ -252,11 +249,7 @@ def build_behavior_index(years, pct_by_2035: float) -> np.ndarray:
 
 def build_capacity_headcount(years, haggett_net_beds: int) -> np.ndarray:
     """
-    Capacity is used only as a physical cap on occupancy headcount, not as a revenue driver.
-    This avoids the common mistake of turning capacity expansion into automatic revenue.
-
-    Baseline cap uses operating capacity + overflow beds (both non-dollar, operational facts).
-    Haggett replacement is modeled as a net bed change effective in 2027 (Fall 2027 opening).
+    Capacity is used ONLY as a physical cap on occupancy headcount, not as a revenue driver.
     """
     base_operating = int(RECONCILED_DATA["housing_portfolio"]["totals"]["total_operating_capacity"]["value"])
     overflow = int(RECONCILED_DATA["housing_portfolio"]["totals"]["overflow_beds"]["value"])
@@ -274,15 +267,7 @@ def build_debt_index(
     custom_peak_year: int,
 ) -> np.ndarray:
     """
-    Debt profile expressed purely as an index (2025 = 100). No dollars.
-
-    Shapes:
-    - Flat (Baseline): 100 forever.
-    - Front-Loaded: 100 in 2025 linearly declining to 80 by 2035, then flat at 80.
-    - The "Cliff" (Risk): 100 until 2030, 120 from 2030-2037, then 80 after.
-    - Custom: user sets Peak Debt Multiplier and Peak Year.
-      Interpreted as an 8-year peak window starting at Peak Year (mirrors 2030-2037),
-      then dropping to 80 afterwards.
+    Debt service timing expressed as an index (2025 = 100). No dollars.
     """
     years = np.asarray(years, dtype=int)
     debt = np.full(len(years), 100.0, dtype=float)
@@ -291,7 +276,6 @@ def build_debt_index(
         return debt
 
     if shape == "Front-Loaded":
-        # Linear decline from 100 (2025) to 80 (2035), then flat 80.
         start, end = BASE_YEAR, 2035
         slope = (80.0 - 100.0) / max(1, (end - start))
         for i, y in enumerate(years):
@@ -325,7 +309,6 @@ def build_debt_index(
                 debt[i] = 100.0
         return clamp(debt, 1.0, None)
 
-    # Safety fallback
     return debt
 
 
@@ -335,11 +318,8 @@ def get_debt_peak_window(
     custom_peak_multiplier: float,
 ) -> Optional[Tuple[int, int]]:
     """
-    UI helper ONLY (does not affect math):
+    UI helper ONLY (does not affect math).
     Returns a peak window to optionally shade on charts when debt timing concentrates risk.
-
-    Why: Execs reason about timing windows ("what happens during the peak years"),
-    not about abstract index series.
     """
     if debt_shape == 'The "Cliff" (Risk)':
         return (2030, 2037)
@@ -367,36 +347,20 @@ def run_model(
 ) -> pd.DataFrame:
     """
     Builds a year-by-year dataframe of indices and DSCR-derived safety metrics.
-
-    Everything is index-based:
-    - Occupancy_Index: occupied headcount vs base headcount (2025=100).
-    - Revenue_Index: Occupancy_Index * (1+Rate_Escalation)^t
-    - Expense_Index: 100*(1+Expense_Inflation)^t
-    - Debt_Index: shape-based index (no dollars)
-    - NOI_Index: derived from Revenue_Index and base-year expense share
-    - DSCR_Est: Base_DSCR * (NOI_Index / Debt_Index)
-    - Safety_Margin_%: remaining cushion as % of base-year cushion
     """
     df = build_ofm_df()
     years = df["year"].to_numpy(dtype=int)
     t = (years - BASE_YEAR).astype(int)
 
-    # Non-resident macro proxy (by 2035), expressed as an index like the WA OFM series.
     national_index = build_national_index(years, national_trend_pct_by_2035)
-
-    # Optional behavioral headwind, outcome-neutral by default (0%).
     behavior_index = build_behavior_index(years, behavior_headwind_pct_by_2035)
 
-    # Combine WA and non-WA demand environments into a single demographic index.
-    # Using weighted average avoids pretending we know exact WA/non-WA enrollment counts.
     wa_share = float(clamp(wa_demand_share, 0.0, 1.0))
     demographic_index = wa_share * df["wa_18yo_index"].to_numpy(dtype=float) + (1.0 - wa_share) * national_index
 
-    # Demand index includes behavior overlay (both are base-100 indices).
     demand_index = safe_div(demographic_index * behavior_index, 100.0, default=0.0)
     demand_index = clamp(demand_index, 0.0, None)
 
-    # Convert demand index into a headcount scale to apply a physical cap.
     base_headcount = float(RECONCILED_DATA["housing_portfolio"]["occupancy"]["current_headcount"]["value"])
     demand_headcount = base_headcount * safe_div(demand_index, 100.0, default=0.0)
 
@@ -404,17 +368,11 @@ def run_model(
     occupied_headcount = np.minimum(demand_headcount, capacity_headcount)
     occupied_headcount = clamp(occupied_headcount, 0.0, None)
 
-    # Occupancy index is the financial “volume driver” (no dollars).
     occupancy_index = safe_div(occupied_headcount, base_headcount, default=0.0) * 100.0
 
-    # Financial indices
-    # Revenue_Index uses occupancy plus rate escalation compounding.
     revenue_index = occupancy_index * np.power(1.0 + float(rate_escalation), t)
-
-    # Expense_Index is modeled as an annual inflation index (fixed-cost flavor).
     expense_index = 100.0 * np.power(1.0 + float(expense_inflation), t)
 
-    # Debt index is shape-based. This is where the “debt cliff” shows up structurally.
     debt_index = build_debt_index(
         years=years,
         shape=debt_shape,
@@ -422,29 +380,19 @@ def run_model(
         custom_peak_year=custom_peak_year,
     )
 
-    # Net Operating Index (raw, not rebased) per spec:
-    # Net_Operating_Index = Revenue_Index - (Expense_Ratio_Base * Expense_Index)
     exp_share = float(clamp(expense_share, 0.0, 1.0))
     net_operating_index = revenue_index - (exp_share * expense_index)
 
-    # NOI_Index rebases Net Operating to 2025 = 100 so DSCR approximation is well-behaved.
-    # Base-year net operating (using indices) is: 100 - exp_share*100 = 100*(1-exp_share)
     net_operating_base = 100.0 * (1.0 - exp_share)
     noi_index = safe_div(net_operating_index, net_operating_base, default=np.nan) * 100.0
 
-    # Relative coverage approximation (high-level, strategic):
-    # New_DSCR ≈ Base_DSCR * (NOI_Index / Debt_Index)
     base_dscr = float(RECONCILED_DATA["financial_ratios"]["base_dscr"]["value"])
     dscr_est = base_dscr * safe_div(noi_index, debt_index, default=np.nan)
 
-    # Safety Margin expressed as % of base-year cushion above covenant.
     required_dscr = float(RECONCILED_DATA["financial_ratios"]["required_dscr"]["value"])
     base_cushion = base_dscr - required_dscr
     safety_margin_pct = safe_div((dscr_est - required_dscr), base_cushion, default=np.nan) * 100.0
 
-    # Extra diagnostic metric requested in prompt (unanchored structural coverage)
-    # Relative_Coverage_Ratio = Net_Operating_Index / (Debt_Ratio_Base * Debt_Index)
-    # Note: This uses a base-year debt share purely as a structural denominator, not dollars.
     debt_sh = float(clamp(debt_share, 0.0, 1.0))
     relative_coverage_ratio = safe_div(net_operating_index, (debt_sh * debt_index), default=np.nan)
 
@@ -478,12 +426,7 @@ def run_model(
 
 def years_until_safety_depleted(df: pd.DataFrame) -> Tuple[str, Optional[int]]:
     """
-    Primary KPI: first year where Safety_Margin_% <= 0 (covenant breach),
-    reported as years from base year.
-
-    Returns:
-    - display string
-    - depletion year (or None)
+    Primary KPI: first year where Safety_Margin_% <= 0 (covenant breach).
     """
     future = df[df["year"] > BASE_YEAR].copy()
     breach = future[future["Safety_Margin_%"] <= 0.0]
@@ -508,21 +451,9 @@ def value_at_year(df: pd.DataFrame, year: int, col: str, default=np.nan) -> floa
 def tornado_sensitivity(base_params: Dict[str, object]) -> Tuple[pd.DataFrame, str]:
     """
     Tornado sensitivity on Safety_Margin_% in the target year.
-
-    Inputs per requirement:
-    - Non-resident pipeline trend
-    - Annual cost growth
-    - Debt peak multiplier
-
-    Approach:
-    - “20% change” is implemented as +/-20% multiplicative shock to the parameter value.
-    - For pipeline trend, we shock the *multiplier* at 2035 (1 + pct), then convert back to pct.
-    - For Debt Peak Multiplier, if the current debt timing doesn't expose a peak multiplier,
-      we temporarily evaluate the parameter using the Custom debt profile (so the knob is meaningful).
     """
     target_year = TARGET_YEAR_TORNADO
 
-    # Helper to run the model and extract a single scalar output.
     def safety_with(params_override: Dict[str, object]) -> float:
         p = dict(base_params)
         p.update(params_override)
@@ -531,7 +462,7 @@ def tornado_sensitivity(base_params: Dict[str, object]) -> Tuple[pd.DataFrame, s
 
     base_safety = safety_with({})
 
-    # --- Parameter 1: Non-resident pipeline trend (shock the multiplier 1+pct)
+    # Non-resident pipeline trend: shock multiplier (1 + pct)
     nat_pct = float(base_params["national_trend_pct_by_2035"])
     nat_mult = 1.0 + nat_pct
     nat_mult_low = clamp(nat_mult * 0.8, 0.5, 1.5)
@@ -539,18 +470,17 @@ def tornado_sensitivity(base_params: Dict[str, object]) -> Tuple[pd.DataFrame, s
     nat_low = clamp(nat_mult_low - 1.0, -0.30, 0.30)
     nat_high = clamp(nat_mult_high - 1.0, -0.30, 0.30)
 
-    # --- Parameter 2: Annual cost growth (shock the annual rate)
+    # Annual cost growth: shock annual rate
     exp_inf = float(base_params["expense_inflation"])
     exp_inf_low = clamp(exp_inf * 0.8, 0.0, 0.10)
     exp_inf_high = clamp(exp_inf * 1.2, 0.0, 0.10)
 
-    # --- Parameter 3: Debt peak multiplier
+    # Debt peak multiplier: shock multiplier, evaluate via Custom if needed
     peak_mult = float(base_params["custom_peak_multiplier"])
     peak_mult_low = clamp(peak_mult * 0.8, 0.6, 1.6)
     peak_mult_high = clamp(peak_mult * 1.2, 0.6, 1.6)
 
     results = []
-
     results.append(
         {
             "Parameter": "Non-Resident Pipeline Trend",
@@ -559,7 +489,6 @@ def tornado_sensitivity(base_params: Dict[str, object]) -> Tuple[pd.DataFrame, s
             "Base": base_safety,
         }
     )
-
     results.append(
         {
             "Parameter": "Annual Cost Growth",
@@ -614,7 +543,7 @@ def tornado_sensitivity(base_params: Dict[str, object]) -> Tuple[pd.DataFrame, s
 
 
 # -----------------------------
-# Streamlit UI helpers (formatting only)
+# UI helpers (formatting only)
 # -----------------------------
 def fmt_num(x: float, fmt: str, na: str = "n/a") -> str:
     return fmt.format(x) if np.isfinite(x) else na
@@ -625,20 +554,17 @@ def scenario_defaults_for(name: str) -> Dict[str, object]:
 
 
 def apply_scenario_defaults(name: str) -> None:
-    """
-    State management helper.
-
-    Why (per UX requirement): directors need to explore safely.
-    This function makes "scenario load" and "reset" deterministic and fast.
-    """
     defaults = scenario_defaults_for(name)
     for k, v in defaults.items():
         st.session_state[k] = v
 
 
 def on_scenario_change() -> None:
-    # Called by the scenario selectbox.
     apply_scenario_defaults(st.session_state.get("scenario", "Baseline"))
+
+
+def traffic_status_line(ok: bool, ok_text: str, bad_text: str) -> str:
+    return f"🟢 {ok_text}" if ok else f"🔴 {bad_text}"
 
 
 # -----------------------------
@@ -647,14 +573,12 @@ def on_scenario_change() -> None:
 st.title("UW HFS Housing Structural Risk Dashboard")
 st.caption("Index-based, outcome-neutral decision support. No currency values are computed or exported.")
 
-# Requirement (Visual Hierarchy): About expander at top of main page.
-# Why: boardroom users won’t read a separate manual. Teach interpretation in-context.
 with st.expander("About This Model", expanded=False):
     st.markdown(
         """
 - This dashboard models structure, not dollars. All outputs are indices where 2025 = 100.
-- Core question: under different demand, cost, and debt timing scenarios, how much of today’s covenant cushion remains?
-- Safety Cushion (% of today’s level):
+- Core question: under different enrollment, cost, and debt timing scenarios, how much of today’s covenant cushion remains?
+- Safety Cushion (% of today):
   - 100% means the same cushion we have today
   - 0% means covenant breach
   - below 0% means below covenant (action required)
@@ -663,12 +587,21 @@ with st.expander("About This Model", expanded=False):
         """.strip()
     )
 
-# Initialize defaults once
+# -----------------------------
+# State initialization + migration
+# -----------------------------
 if "initialized" not in st.session_state:
     st.session_state["scenario"] = "Baseline"
     for k, v in SCENARIOS["Baseline"].items():
         st.session_state[k] = v
     st.session_state["initialized"] = True
+
+# Migration safeguard:
+# If a user had v2 loaded where wa_demand_share was stored as 0.70, convert to 70.
+if "wa_demand_share" in st.session_state:
+    v = st.session_state["wa_demand_share"]
+    if isinstance(v, float) and 0.0 <= v <= 1.0:
+        st.session_state["wa_demand_share"] = int(round(v * 100))
 
 
 # -----------------------------
@@ -677,7 +610,6 @@ if "initialized" not in st.session_state:
 with st.sidebar:
     st.header("Controls")
 
-    # Scenario selection
     st.selectbox(
         "Scenario (One-click)",
         options=list(SCENARIOS.keys()),
@@ -689,8 +621,6 @@ with st.sidebar:
     scenario_name = str(st.session_state.get("scenario", "Baseline"))
     st.info(SCENARIO_CONTEXT.get(scenario_name, "Scenario loaded."))
 
-    # Requirement (State Mgmt): Reset to *current* scenario defaults.
-    # Why: encourages exploration without fear of “breaking” the model.
     defaults_exist = len(scenario_defaults_for(scenario_name)) > 0
     if st.button(
         "Reset to Scenario Defaults",
@@ -701,18 +631,21 @@ with st.sidebar:
         apply_scenario_defaults(scenario_name)
         st.success("Scenario defaults reloaded.")
 
-    st.subheader("Demand & Preference")
+    st.subheader("Enrollment & Preference")
 
-    # Requirement (Executive Translation): rename jargon to plain-English.
     st.slider(
         "Enrollment Source Weighting",
-        min_value=0.40,
-        max_value=0.90,
-        step=0.01,
+        min_value=40,
+        max_value=90,
+        step=1,
         key="wa_demand_share",
+        format="%d%%",
         help=(
-            "How much does our demand rely on WA residents vs. Non-Residents? "
-            "Higher means we are more dependent on local demographics."
+            "Units: percent. This is the weighting used to blend demand drivers.\n\n"
+            "Example: 70% means the model assumes 70% of housing demand moves with WA OFM demographics, "
+            "and 30% moves with the non-resident pipeline trend.\n\n"
+            "Use higher values if you believe demand is more WA-dependent, use lower values if non-resident "
+            "conditions dominate."
         ),
     )
 
@@ -722,7 +655,13 @@ with st.sidebar:
         max_value=30,
         step=1,
         key="national_trend_pct_by_2035",
-        help="Forecast for the out-of-state/international student market. -10% means the pool of potential students shrinks by 10%.",
+        format="%d%%",
+        help=(
+            "Units: percent change by 2035 relative to 2025 for the out-of-state/international market.\n\n"
+            "Example: -10% means the non-resident pipeline index goes from 100 (2025) to 90 (2035), "
+            "then holds at 90 after 2035.\n\n"
+            "Range guide: -30% is a severe contraction, +30% is a strong tailwind."
+        ),
     )
 
     st.slider(
@@ -731,7 +670,13 @@ with st.sidebar:
         max_value=10,
         step=1,
         key="behavior_headwind_pct_by_2035",
-        help="Are students choosing U-District apartments instead of us? Slide left (-%) to model losing market share to off-campus competitors.",
+        format="%d%%",
+        help=(
+            "Units: percent change by 2035 relative to 2025 applied on top of demographics.\n\n"
+            "Example: -5% means that by 2035, demand is 95% of what demographics alone would imply "
+            "(students choosing off-campus options more often).\n\n"
+            "Use positive values only if you believe HFS becomes more preferred relative to alternatives."
+        ),
     )
 
     st.slider(
@@ -740,7 +685,12 @@ with st.sidebar:
         max_value=1000,
         step=25,
         key="haggett_net_beds",
-        help="Physical bed capacity change from the Haggett project. Used only to cap the maximum number of students we can house.",
+        help=(
+            "Units: beds (headcount cap).\n\n"
+            "This does not create demand or revenue by itself. It only changes the maximum students we can house.\n\n"
+            "Example: +200 means the model will allow up to 200 more occupied students starting in 2027 "
+            "if demand exists."
+        ),
     )
 
     st.subheader("Prices & Costs")
@@ -751,7 +701,12 @@ with st.sidebar:
         max_value=6.0,
         step=0.1,
         key="rate_escalation_pct",
-        help="The average annual percentage increase in room rates charged to students.",
+        format="%.1f%%",
+        help=(
+            "Units: percent per year.\n\n"
+            "Applies to the Revenue Index as compounding growth on top of occupancy changes.\n\n"
+            "Example: 3.0% means Revenue Index multiplies by 1.03 each year (after occupancy effects)."
+        ),
     )
 
     st.slider(
@@ -760,7 +715,12 @@ with st.sidebar:
         max_value=6.0,
         step=0.1,
         key="expense_inflation_pct",
-        help="The average annual increase in expenses (Salaries, Utilities, COGS).",
+        format="%.1f%%",
+        help=(
+            "Units: percent per year.\n\n"
+            "Applies to the Cost Index as compounding annual growth (salaries, utilities, COGS).\n\n"
+            "Example: 4.0% means Cost Index multiplies by 1.04 each year."
+        ),
     )
 
     st.subheader("Debt")
@@ -769,7 +729,10 @@ with st.sidebar:
         "Debt Service Timing",
         options=DEBT_SHAPES,
         key="debt_shape",
-        help="Models the timing pattern of debt payments. Select 'The Cliff' to see the impact of the 2030–2037 peak.",
+        help=(
+            "Models the timing pattern of debt payments as an index (2025 = 100), not a dollar schedule.\n\n"
+            "Tip: Select 'The Cliff' to see the 2030–2037 peak (Debt Index = 120) before it drops."
+        ),
     )
 
     if st.session_state["debt_shape"] == "Custom":
@@ -779,7 +742,11 @@ with st.sidebar:
             max_value=1.50,
             step=0.01,
             key="custom_peak_multiplier",
-            help="Debt Index equals 100×multiplier during the peak window (8 years starting at Peak Year).",
+            help=(
+                "Units: multiplier.\n\n"
+                "Example: 1.20 means debt service load is 20% higher during the peak window.\n\n"
+                "Applied for 8 years starting at Peak Year, then the model drops to 80 after the peak."
+            ),
         )
         st.slider(
             "Peak Year",
@@ -787,7 +754,7 @@ with st.sidebar:
             max_value=2040,
             step=1,
             key="custom_peak_year",
-            help="Start year of the 8-year peak window for Custom timing.",
+            help="Units: year. Start of the 8-year peak window for the Custom debt timing profile.",
         )
     elif st.session_state["debt_shape"] == 'The "Cliff" (Risk)':
         st.caption("Cliff definition: Debt Index = 120 for 2030–2037, then 80 from 2038 onward.")
@@ -799,7 +766,13 @@ with st.sidebar:
             max_value=70,
             step=1,
             key="expense_share_pct",
-            help="Used to compute Net Operating Index as Revenue_Index - expense_share×Expense_Index.",
+            format="%d%%",
+            help=(
+                "Units: percent of base-year Revenue Index.\n\n"
+                "Example: 50% means that in the base year, Expense Index contributes 50 points (of 100), "
+                "and Net Operating is 50 points (before rebasing).\n\n"
+                "Expenses then grow annually using Annual Cost Growth."
+            ),
         )
         st.slider(
             "Debt Service Share (base year)",
@@ -807,7 +780,12 @@ with st.sidebar:
             max_value=50,
             step=1,
             key="debt_share_pct",
-            help="Used only for the unanchored Relative_Coverage_Ratio diagnostic (still no dollars).",
+            format="%d%%",
+            help=(
+                "Units: percent of base-year Revenue Index.\n\n"
+                "Used only for the diagnostic 'Relative Coverage Ratio' (structural denominator). "
+                "It does not change the DSCR estimate, which is anchored to Base DSCR."
+            ),
         )
 
     with st.expander("Reference: DSCR Anchors (read-only)", expanded=False):
@@ -819,7 +797,7 @@ with st.sidebar:
 # Collect params (convert UI % to decimals)
 # -----------------------------
 params = {
-    "wa_demand_share": float(st.session_state["wa_demand_share"]),
+    "wa_demand_share": float(st.session_state["wa_demand_share"]) / 100.0,
     "national_trend_pct_by_2035": float(st.session_state["national_trend_pct_by_2035"]) / 100.0,
     "behavior_headwind_pct_by_2035": float(st.session_state["behavior_headwind_pct_by_2035"]) / 100.0,
     "haggett_net_beds": int(st.session_state["haggett_net_beds"]),
@@ -845,49 +823,63 @@ dscr_2035 = value_at_year(df, TARGET_YEAR_TORNADO, "DSCR_Est", default=np.nan)
 safety_2035 = value_at_year(df, TARGET_YEAR_TORNADO, "Safety_Margin_%", default=np.nan)
 min_safety = float(np.nanmin(df["Safety_Margin_%"].to_numpy(dtype=float)))
 
-# Requirement (Traffic Light Metrics):
-# - DSCR: green if > covenant, red if < covenant.
-# - Safety Cushion: green if > 100%, red if < 100%.
-dscr_delta = (dscr_2035 - required_dscr) if np.isfinite(dscr_2035) else None
-safety_delta = (safety_2035 - 100.0) if np.isfinite(safety_2035) else None
-
-# Optional UI-only shading window
 peak_window = get_debt_peak_window(
     debt_shape=params["debt_shape"],
     custom_peak_year=params["custom_peak_year"],
     custom_peak_multiplier=params["custom_peak_multiplier"],
 )
 
+# Traffic-light logic (no numeric delta display)
+dscr_ok = bool(np.isfinite(dscr_2035) and dscr_2035 >= required_dscr)
+safety_ok = bool(np.isfinite(safety_2035) and safety_2035 >= 100.0)
+
+if np.isfinite(safety_2035) and safety_2035 <= 0.0:
+    safety_status = "🔴 Covenant breach (≤ 0%)"
+elif safety_ok:
+    safety_status = "🟢 At or above today’s cushion (≥ 100%)"
+else:
+    safety_status = "🔴 Cushion below today (< 100%)"
+
+
 # -----------------------------
-# KPI row (boardroom-friendly framing)
+# KPI row
 # -----------------------------
 k1, k2, k3, k4 = st.columns(4)
 
-k1.metric(
-    "Years until Covenant Breach (Safety Cushion ≤ 0%)",
-    depletion_text,
-)
+with k1:
+    st.metric("Years until Covenant Breach (Safety Cushion ≤ 0%)", depletion_text)
 
-k2.metric(
-    f"Coverage (DSCR) in {TARGET_YEAR_TORNADO}",
-    fmt_num(dscr_2035, "{:.2f}"),
-    dscr_delta,
-    delta_color="normal",
-    help="Green means coverage is above covenant. Red means below covenant.",
-)
+with k2:
+    st.metric(f"Coverage (DSCR) in {TARGET_YEAR_TORNADO}", fmt_num(dscr_2035, "{:.2f}"))
+    st.caption(traffic_status_line(dscr_ok, f"Above covenant ({required_dscr:.2f})", f"Below covenant ({required_dscr:.2f})"))
 
-k3.metric(
-    f"Safety Cushion in {TARGET_YEAR_TORNADO}",
-    fmt_num(safety_2035, "{:.0f}%"),
-    safety_delta,
-    delta_color="normal",
-    help="Green means the cushion is larger than today (100%). Red means cushion is eroding below today’s level.",
-)
+with k3:
+    st.metric(f"Safety Cushion in {TARGET_YEAR_TORNADO}", fmt_num(safety_2035, "{:.0f}%"))
+    st.caption(safety_status)
 
-k4.metric(
-    "Worst-Year Safety Cushion (2025–2045)",
-    fmt_num(min_safety, "{:.0f}%"),
-)
+with k4:
+    st.metric("Worst-Year Safety Cushion (2025–2045)", fmt_num(min_safety, "{:.0f}%"))
+
+with st.expander("Assumptions at a Glance", expanded=False):
+    wa_pct = int(st.session_state["wa_demand_share"])
+    nonwa_pct = 100 - wa_pct
+    st.markdown(
+        f"""
+- Scenario: {scenario_name}
+- Enrollment source weighting: {wa_pct}% WA demographic trend, {nonwa_pct}% non-resident pipeline trend
+- Non-resident pipeline trend (by 2035): {int(st.session_state["national_trend_pct_by_2035"])}%
+- Housing preference shift (by 2035): {int(st.session_state["behavior_headwind_pct_by_2035"])}%
+- New capacity (net beds): {int(st.session_state["haggett_net_beds"])} (effective 2027)
+- Annual rent increase: {float(st.session_state["rate_escalation_pct"]):.1f}%
+- Annual cost growth: {float(st.session_state["expense_inflation_pct"]):.1f}%
+- Debt service timing: {st.session_state["debt_shape"]}
+        """.strip()
+    )
+    if st.session_state["debt_shape"] == "Custom":
+        st.markdown(
+            f"- Custom peak: {float(st.session_state['custom_peak_multiplier']):.2f}× starting {int(st.session_state['custom_peak_year'])}"
+        )
+
 
 tabs = st.tabs(["Dashboard", "Sensitivity (Tornado)", "Data Export"])
 
@@ -898,7 +890,6 @@ tabs = st.tabs(["Dashboard", "Sensitivity (Tornado)", "Data Export"])
 with tabs[0]:
     left, right = st.columns(2)
 
-    # --- Chart 1: Structural Balance (Revenue vs Cost)
     with left:
         st.subheader("Structural Balance: Revenue Growth vs. Cost Growth")
 
@@ -922,7 +913,7 @@ with tabs[0]:
                     x=alt.X("year:Q", title="Year", axis=alt.Axis(format="d")),
                     y=alt.Y("Index:Q", title="Index (2025 = 100)"),
                     color=alt.Color("Series:N", title=""),
-                    tooltip=["year:Q", "Series:N", alt.Tooltip("Index:Q", format=".1f")],
+                    tooltip=[alt.Tooltip("year:Q", format="d"), "Series:N", alt.Tooltip("Index:Q", format=".1f")],
                 )
                 .properties(height=320)
             )
@@ -934,7 +925,6 @@ with tabs[0]:
 
         st.caption("When costs grow faster than revenue, the covenant safety cushion tends to compress.")
 
-    # --- Chart 2: Safety Cushion over time
     with right:
         st.subheader("Covenant Safety Cushion (100% = Today's Level)")
 
@@ -956,16 +946,14 @@ with tabs[0]:
                 .encode(
                     x=alt.X("year:Q", title="Year", axis=alt.Axis(format="d")),
                     y=alt.Y("Safety Cushion (%):Q", title="Safety Cushion (% of today)"),
-                    tooltip=["year:Q", alt.Tooltip("Safety Cushion (%):Q", format=".1f")],
+                    tooltip=[alt.Tooltip("year:Q", format="d"), alt.Tooltip("Safety Cushion (%):Q", format=".1f")],
                 )
                 .properties(height=320)
             )
 
-            # Reference lines: 100% (today) and 0% (breach)
             ref_100 = alt.Chart(pd.DataFrame({"y": [100.0]})).mark_rule(color="#666", strokeDash=[4, 4]).encode(y="y:Q")
             ref_0 = alt.Chart(pd.DataFrame({"y": [0.0]})).mark_rule(color="#888").encode(y="y:Q")
 
-            # Optional breach-year marker
             breach_rule = None
             if depletion_year is not None:
                 breach_rule = (
@@ -986,7 +974,6 @@ with tabs[0]:
 
         st.caption("100% = same cushion as today, 0% = covenant breach, negative = below covenant.")
 
-    # --- Chart 3: Projected coverage trend
     st.subheader("Projected Coverage Trend")
 
     dscr_df = df[["year", "DSCR_Est"]].copy()
@@ -1007,7 +994,7 @@ with tabs[0]:
             .encode(
                 x=alt.X("year:Q", title="Year", axis=alt.Axis(format="d")),
                 y=alt.Y("Coverage (DSCR):Q", title="DSCR"),
-                tooltip=["year:Q", alt.Tooltip("Coverage (DSCR):Q", format=".2f")],
+                tooltip=[alt.Tooltip("year:Q", format="d"), alt.Tooltip("Coverage (DSCR):Q", format=".2f")],
             )
             .properties(height=260)
         )
@@ -1034,10 +1021,9 @@ with tabs[0]:
 with tabs[1]:
     st.subheader(f"Tornado Sensitivity: Safety Cushion in {TARGET_YEAR_TORNADO}")
 
-    tornado_base_params = dict(params)  # already decimals and model-ready
+    tornado_base_params = dict(params)
     df_t, summary = tornado_sensitivity(tornado_base_params)
 
-    # Build tornado bars as ranges (Low -> High)
     df_t_plot = df_t.copy()
     df_t_plot["Low"] = df_t_plot[["Low (20%)", "High (20%)"]].min(axis=1)
     df_t_plot["High"] = df_t_plot[["Low (20%)", "High (20%)"]].max(axis=1)
@@ -1071,8 +1057,8 @@ with tabs[1]:
     st.write(summary)
 
     st.caption(
-        "Note: If the current debt timing does not expose a peak multiplier, the sensitivity test "
-        "temporarily evaluates the Debt Peak Multiplier using the Custom timing profile so the knob is meaningful."
+        "Note: If the current debt timing does not expose a peak multiplier, the sensitivity test temporarily "
+        "evaluates the Debt Peak Multiplier using the Custom timing profile so the knob is meaningful."
     )
 
 
@@ -1103,7 +1089,6 @@ with tabs[2]:
 
     display_df = df[export_cols].copy()
 
-    # Round for readability while keeping indices, not dollars.
     round_map = {c: 1 for c in export_cols if c not in {"year", "WA_18yo_Population", "Covenant_Breach"}}
     display_df = display_df.round(round_map)
 
