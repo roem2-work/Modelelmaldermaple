@@ -1,7 +1,16 @@
 # uw_housing_model.py
 """
 UW HFS Housing Structural Risk Model (Index-Based, Outcome Neutral)
-v4.2 - Code Review Improvements
+v4.3 - Capacity Cost Fix
+
+Changes in v4.3:
+- CRITICAL FIX: Capacity changes now affect costs and debt, not just revenue cap
+  * Adding beds increases operating costs (building maintenance, utilities, staff)
+  * Adding beds increases debt service (construction bonds)
+  * Revenue only increases if students actually fill the beds
+  * This models the "build it and they may not come" risk correctly
+- Added capacity cost sensitivity sliders in Advanced section
+- New export columns: Expense_Cap_Factor, Debt_Cap_Factor
 
 Changes in v4.2 (Code Review Implementation):
 - Extracted demand index calculation into dedicated function for clarity and testability
@@ -181,6 +190,9 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "custom_peak_multiplier": 1.20,
         "custom_peak_year": 2030,
         "focus_year": 2035,
+        # Capacity cost sensitivities (v4.2 addition)
+        "capacity_expense_sensitivity_pct": 50,  # 50% of capacity change → expense change
+        "capacity_debt_sensitivity_pct": 150,    # 150% of capacity change → debt change
     },
     "Structural Squeeze": {
         "debt_shape": 'The "Cliff" (Risk)',
@@ -200,6 +212,8 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "custom_peak_multiplier": 1.20,
         "custom_peak_year": 2030,
         "focus_year": 2035,
+        "capacity_expense_sensitivity_pct": 50,
+        "capacity_debt_sensitivity_pct": 150,
     },
     "Demographic Trough": {
         "debt_shape": "Flat (Baseline)",
@@ -219,6 +233,8 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "custom_peak_multiplier": 1.20,
         "custom_peak_year": 2030,
         "focus_year": 2035,
+        "capacity_expense_sensitivity_pct": 50,
+        "capacity_debt_sensitivity_pct": 150,
     },
     "Bond Stress Test (Illustrative)": {
         "debt_shape": 'The "Cliff" (Risk)',
@@ -238,6 +254,8 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "custom_peak_multiplier": 1.20,
         "custom_peak_year": 2030,
         "focus_year": 2035,
+        "capacity_expense_sensitivity_pct": 50,
+        "capacity_debt_sensitivity_pct": 150,
     },
     "Custom (Keep Current Settings)": {},
 }
@@ -542,6 +560,50 @@ def compute_demand_index(
     return clamp(demand_index, 0.0, None)
 
 
+def compute_capacity_cost_factors(
+    capacity_index: np.ndarray,
+    expense_sensitivity: float = 0.50,
+    debt_sensitivity: float = 1.50,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate cost scaling factors when capacity changes.
+
+    Code Review Addition (v4.2): This function addresses the critical gap where
+    capacity changes had no impact on costs. In reality:
+    - New buildings require bonds (debt service increases)
+    - New buildings require maintenance/utilities/staff (operating costs increase)
+    - Revenue only increases if students actually fill the beds
+
+    The "build it and they will come" assumption is dangerous for bond covenants.
+
+    Args:
+        capacity_index: Capacity index over time (100 = base year)
+        expense_sensitivity: What fraction of capacity change affects operating costs.
+            Default 0.50 means 10% more capacity → 5% more operating costs.
+            Rationale: Some costs are fixed (admin), some scale with capacity.
+        debt_sensitivity: How much debt service scales with capacity change.
+            Default 1.50 means 10% more capacity → 15% more debt service.
+            Rationale: Construction is capital-intensive; new buildings carry
+            disproportionate debt load relative to their bed count.
+
+    Returns:
+        Tuple of (expense_factor, debt_factor) arrays, where 1.0 = no change
+    """
+    # Calculate percentage change from base capacity
+    # capacity_index = 110 means 10% more capacity → delta = 0.10
+    capacity_delta = (capacity_index - BASE_INDEX) / BASE_INDEX
+
+    # Scale factors (1.0 at base capacity)
+    expense_factor = 1.0 + (capacity_delta * expense_sensitivity)
+    debt_factor = 1.0 + (capacity_delta * debt_sensitivity)
+
+    # Ensure factors don't go negative (e.g., if capacity drops dramatically)
+    expense_factor = np.maximum(expense_factor, 0.1)
+    debt_factor = np.maximum(debt_factor, 0.1)
+
+    return expense_factor, debt_factor
+
+
 def build_capacity_headcount(years: np.ndarray, haggett_net_beds: int) -> np.ndarray:
     """
     Build physical capacity headcount over time.
@@ -687,6 +749,8 @@ def run_model(
     debt_shape: str,
     custom_peak_multiplier: float,
     custom_peak_year: int,
+    capacity_expense_sensitivity: float = 0.50,
+    capacity_debt_sensitivity: float = 1.50,
 ) -> pd.DataFrame:
     """
     Run the structural risk model and return year-by-year projections.
@@ -711,6 +775,11 @@ def run_model(
         debt_shape: Debt timing pattern name
         custom_peak_multiplier: For custom debt shape
         custom_peak_year: For custom debt shape
+        capacity_expense_sensitivity: How much operating costs scale with capacity
+            changes. 0.50 means 10% more capacity → 5% more operating costs.
+        capacity_debt_sensitivity: How much debt service scales with capacity
+            changes. 1.50 means 10% more capacity → 15% more debt service
+            (construction is capital-intensive).
 
     Returns:
         DataFrame with all projection metrics by year
@@ -755,19 +824,42 @@ def run_model(
         safe_div(occupied_headcount, base_headcount, default=0.0) * BASE_INDEX
     )
 
-    # Revenue and expense indices with compound growth
-    # Code Review Note (v4.2): Verified that compound growth is bounded by slider caps
-    # Max expense growth (10%) over 20 years = 6.7x, which is realistic for stress testing
-    revenue_index = occupancy_index * np.power(1.0 + float(rate_escalation), t)
-    expense_index = BASE_INDEX * np.power(1.0 + float(expense_inflation), t)
+    # Calculate capacity index for cost scaling
+    # Code Review Fix (v4.2): Capacity changes now affect costs, not just revenue cap
+    capacity_index = (
+        safe_div(capacity_headcount, base_headcount, default=np.nan) * BASE_INDEX
+    )
 
-    # Debt timing index
-    debt_index = build_debt_index(
+    # Calculate cost scaling factors for capacity changes
+    # This is the KEY FIX: building empty beds costs money!
+    # - New buildings require bonds → debt service increases
+    # - New buildings require maintenance → operating costs increase
+    expense_cap_factor, debt_cap_factor = compute_capacity_cost_factors(
+        capacity_index,
+        expense_sensitivity=capacity_expense_sensitivity,
+        debt_sensitivity=capacity_debt_sensitivity,
+    )
+
+    # Revenue and expense indices with compound growth
+    # Code Review Note (v4.2): Expenses now scale with BOTH inflation AND capacity
+    revenue_index = occupancy_index * np.power(1.0 + float(rate_escalation), t)
+    expense_index = (
+        BASE_INDEX
+        * expense_cap_factor  # NEW: capacity scaling
+        * np.power(1.0 + float(expense_inflation), t)
+    )
+
+    # Debt timing index (models WHEN payments are higher/lower)
+    debt_timing_index = build_debt_index(
         years=years,
         shape=debt_shape,
         custom_peak_multiplier=custom_peak_multiplier,
         custom_peak_year=custom_peak_year,
     )
+
+    # Apply capacity scaling to debt (models HOW MUCH total debt)
+    # Code Review Fix (v4.2): New construction adds to debt service
+    debt_index = debt_timing_index * debt_cap_factor
 
     # Net operating index (revenue minus expenses, as indices)
     exp_share = float(clamp(expense_share, 0.0, 1.0))
@@ -808,10 +900,9 @@ def run_model(
             "Demographic_Index": demographic_index.astype(float),
             "Demand_Index": demand_index.astype(float),
             "Capacity_Headcount_Cap": capacity_headcount.astype(float),
-            "Capacity_Index": (
-                safe_div(capacity_headcount, base_headcount, default=np.nan)
-                * BASE_INDEX
-            ).astype(float),
+            "Capacity_Index": capacity_index.astype(float),  # Now pre-calculated
+            "Expense_Cap_Factor": expense_cap_factor.astype(float),  # NEW: transparency
+            "Debt_Cap_Factor": debt_cap_factor.astype(float),  # NEW: transparency
             "Occupied_Headcount": occupied_headcount.astype(float),
             "Occupancy_Index": occupancy_index.astype(float),
             "Revenue_Index": revenue_index.astype(float),
@@ -1077,6 +1168,13 @@ if "uw_enrollment_trend_pct" not in st.session_state:
 if "focus_year" not in st.session_state:
     st.session_state["focus_year"] = 2035
 
+# v4.2 addition: capacity cost sensitivity parameters
+if "capacity_expense_sensitivity_pct" not in st.session_state:
+    st.session_state["capacity_expense_sensitivity_pct"] = 50
+
+if "capacity_debt_sensitivity_pct" not in st.session_state:
+    st.session_state["capacity_debt_sensitivity_pct"] = 150
+
 
 # =============================================================================
 # SIDEBAR CONTROLS
@@ -1200,8 +1298,12 @@ with st.sidebar:
         key="haggett_net_beds",
         help=(
             "Net change in housing capacity from construction projects.\n\n"
-            "This only changes how many students CAN be housed. "
-            "It does not create additional demand."
+            "**Important:** Adding beds increases BOTH costs and debt service, "
+            "regardless of whether students fill those beds. This models the "
+            "'build it and they may not come' risk.\n\n"
+            "• Positive values: New construction (adds costs + debt)\n"
+            "• Negative values: Closing/demolishing buildings (reduces costs)\n"
+            "• Revenue only increases if students actually fill the beds"
         ),
     )
 
@@ -1307,6 +1409,41 @@ with st.sidebar:
             ),
         )
 
+    # Code Review Addition (v4.2): Capacity cost sensitivity controls
+    with st.expander("Advanced: Capacity Cost Assumptions", expanded=False):
+        st.caption(
+            "How much do costs increase when you add capacity? "
+            "These control the financial impact of building new beds."
+        )
+        st.slider(
+            "Operating Cost Sensitivity",
+            min_value=0,
+            max_value=100,
+            step=5,
+            key="capacity_expense_sensitivity_pct",
+            format="%d%%",
+            help=(
+                "What fraction of capacity change translates to operating cost change?\n\n"
+                "Example: 50% means adding 10% more beds increases operating costs by 5%.\n\n"
+                "Lower values = some costs are fixed regardless of building count.\n"
+                "Higher values = most costs scale with physical plant size."
+            ),
+        )
+        st.slider(
+            "Debt Service Sensitivity",
+            min_value=50,
+            max_value=250,
+            step=10,
+            key="capacity_debt_sensitivity_pct",
+            format="%d%%",
+            help=(
+                "How much does debt service increase relative to capacity change?\n\n"
+                "Example: 150% means adding 10% more beds increases debt service by 15%.\n\n"
+                "Values > 100% reflect that new construction is capital-intensive "
+                "(new buildings carry more debt per bed than existing portfolio average)."
+            ),
+        )
+
     with st.expander("Reference: Bond Requirements", expanded=False):
         st.write(f"**Current Coverage Ratio (2022 actual):** {base_dscr:.2f}")
         st.write(f"**Minimum Required (covenant):** {required_dscr:.2f}")
@@ -1340,6 +1477,13 @@ params = {
         st.session_state.get("custom_peak_multiplier", 1.20)
     ),
     "custom_peak_year": int(st.session_state.get("custom_peak_year", 2030)),
+    # v4.2 addition: capacity cost sensitivity
+    "capacity_expense_sensitivity": float(
+        st.session_state.get("capacity_expense_sensitivity_pct", 50)
+    ) / 100.0,
+    "capacity_debt_sensitivity": float(
+        st.session_state.get("capacity_debt_sensitivity_pct", 150)
+    ) / 100.0,
 }
 
 df = run_model(**params)
@@ -1837,6 +1981,8 @@ with tabs[1]:
         "Demographic_Index",
         "Demand_Index",
         "Capacity_Index",
+        "Expense_Cap_Factor",  # v4.2 addition
+        "Debt_Cap_Factor",     # v4.2 addition
         "Occupancy_Index",
         "Revenue_Index",
         "Expense_Index",
@@ -1858,10 +2004,12 @@ with tabs[1]:
         "Demographic_Index": "Blended Demographic Index",
         "Demand_Index": "Total Demand Index",
         "Capacity_Index": "Capacity Index",
+        "Expense_Cap_Factor": "Capacity→Expense Factor",  # v4.2 addition
+        "Debt_Cap_Factor": "Capacity→Debt Factor",        # v4.2 addition
         "Occupancy_Index": "Occupancy Index",
         "Revenue_Index": "Revenue Index",
         "Expense_Index": "Expense Index",
-        "Debt_Index": "Debt Timing Index",
+        "Debt_Index": "Debt Index",
         "NOI_Index": "Operating Buffer Index",
         "DSCR_Est": "Coverage Ratio (Est)",
         "Headroom_Above_Min_DSCR": "Safety Cushion",
@@ -1885,6 +2033,8 @@ with tabs[1]:
             "Demographic_Index": 1,
             "Demand_Index": 1,
             "Capacity_Index": 1,
+            "Expense_Cap_Factor": 2,  # v4.2 addition
+            "Debt_Cap_Factor": 2,     # v4.2 addition
             "Occupancy_Index": 1,
             "Revenue_Index": 1,
             "Expense_Index": 1,
@@ -1922,11 +2072,13 @@ with tabs[1]:
 | Housing Preference Index | Fraction of students choosing on-campus housing |
 | Blended Demographic Index | Weighted blend of WA and out-of-state |
 | Total Demand Index | Combined demand from all factors |
-| Capacity Index | Physical housing capacity |
+| Capacity Index | Physical housing capacity relative to base year |
+| Capacity→Expense Factor | Multiplier on operating costs from capacity changes (1.0 = no change) |
+| Capacity→Debt Factor | Multiplier on debt service from capacity changes (1.0 = no change) |
 | Occupancy Index | Actual beds filled (demand capped by capacity) |
 | Revenue Index | Revenue from housing operations |
-| Expense Index | Operating cost growth |
-| Debt Timing Index | When debt payments are higher/lower |
+| Expense Index | Operating cost growth (includes capacity and inflation effects) |
+| Debt Index | Debt service level (includes timing pattern and capacity effects) |
 | Operating Buffer Index | Cash available for debt service |
 | Coverage Ratio (Est) | DSCR estimate (must stay above 1.25) |
 | Safety Cushion | DSCR points above minimum requirement |
@@ -1942,7 +2094,7 @@ with tabs[1]:
 
 st.divider()
 st.caption(
-    "UW HFS Housing Structural Risk Model v4.2 | "
+    "UW HFS Housing Structural Risk Model v4.3 | "
     "Index-based projections for strategic planning | "
     "Questions? Contact HFS Finance"
 )
