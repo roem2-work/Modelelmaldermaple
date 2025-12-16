@@ -1,35 +1,32 @@
 # uw_housing_model.py
 """
 UW HFS Housing Structural Risk Model (Index-Based, Outcome Neutral)
-v4.3 - Capacity Cost Fix
+v4.4 - Feedback Integration
 
-Changes in v4.3:
-- CRITICAL FIX: Capacity changes now affect costs and debt, not just revenue cap
-  * Adding beds increases operating costs (building maintenance, utilities, staff)
-  * Adding beds increases debt service (construction bonds)
-  * Revenue only increases if students actually fill the beds
-  * This models the "build it and they may not come" risk correctly
-- CHART FIX: Capacity_Index now indexed to base CAPACITY, not base HEADCOUNT
-  * Old: showed 109 even with no bed changes (confusing)
-  * New: shows 100 when no beds added, >100 when beds added
-  * Also fixes hidden bug where baseline had 14% debt penalty for spare capacity
-- Added capacity cost sensitivity sliders in Advanced section
-- New export columns: Expense_Cap_Factor, Debt_Cap_Factor
+Changes in v4.4 (Feedback Integration):
+- FIX: "UW Class Size Change" now ramps to 2035 like other levers, preserving 2025=100.
+  Previous version applied change to ALL years including 2025, breaking the base-year anchor.
+- FIX: Closing buildings no longer reduces debt service (unrealistic).
+  Debt factor now only increases for new construction; existing bonds remain.
+  Expense factor still decreases for closures (fewer buildings to maintain).
+- FIX: Chart caption for Beds Filled vs Capacity now correctly explains indexed comparison.
+- FIX: Removed dollar signs from narrative text (maintains "no currency" posture).
+- FIX: Clarified that base DSCR is from 2022 audited data, not a 2025 value.
+- FIX: Python 3.9 compatibility (replaced | union syntax with typing.Union/Optional).
+- Updated slider labels to match "by 2035" ramping behavior.
+
+Changes in v4.3 (Capacity Cost Fix):
+- Capacity changes now affect costs and debt, not just revenue cap.
+- Capacity_Index now indexed to base CAPACITY, not base HEADCOUNT.
+- Added capacity cost sensitivity sliders.
 
 Changes in v4.2 (Code Review Implementation):
-- Extracted demand index calculation into dedicated function for clarity and testability
-- Added comprehensive inline comments for traceability
-- Reduced executive jargon in labels and tooltips
-- Added plain-English interpretation callouts for KPI cards
-- Improved scenario descriptions with "when to use" guidance
-- Enhanced type hints for numerical safety functions
-- Fixed Custom scenario reset button UX with clearer tooltip
-- Documented magic numbers and index normalization logic
-- Added colorblind-friendly considerations to chart annotations
+- Extracted demand index calculation into dedicated function.
+- Reduced executive jargon in labels and tooltips.
+- Added plain-English interpretation callouts for KPI cards.
 
 Previous fixes (v4.1):
-- Charts collapsing under scenarios with a debt-peak band was caused by the
-  peak-band layer not sharing the same explicit x-scale domain as the rest of the chart.
+- Fixed Altair chart collapse bug with debt-peak band layer.
 - Added "UW Enrollment Trend (Class Size)" slider.
 
 Constraints:
@@ -44,7 +41,7 @@ Run:
 from __future__ import annotations
 
 from io import StringIO
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union, Optional
 
 import numpy as np
 import pandas as pd
@@ -194,7 +191,7 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
         "custom_peak_multiplier": 1.20,
         "custom_peak_year": 2030,
         "focus_year": 2035,
-        # Capacity cost sensitivities (v4.2 addition)
+        # Capacity cost sensitivities (v4.3 addition)
         "capacity_expense_sensitivity_pct": 50,  # 50% of capacity change → expense change
         "capacity_debt_sensitivity_pct": 150,    # 150% of capacity change → debt change
     },
@@ -299,10 +296,10 @@ SCENARIO_CONTEXT: Dict[str, str] = {
 
 
 def safe_div(
-    n: np.ndarray | float,
-    d: np.ndarray | float,
+    n: Union[np.ndarray, float],
+    d: Union[np.ndarray, float],
     default: float = np.nan,
-) -> np.ndarray | float:
+) -> Union[np.ndarray, float]:
     """
     Division that never throws divide-by-zero and never returns inf/-inf.
 
@@ -325,10 +322,10 @@ def safe_div(
 
 
 def clamp(
-    x: np.ndarray | float,
-    lo: float | None = None,
-    hi: float | None = None,
-) -> np.ndarray | float:
+    x: Union[np.ndarray, float],
+    lo: Optional[float] = None,
+    hi: Optional[float] = None,
+) -> Union[np.ndarray, float]:
     """
     Clamp values to a range, handling None bounds gracefully.
 
@@ -389,10 +386,10 @@ def finite_minmax(vals: np.ndarray) -> Tuple[float, float]:
 def padded_domain(
     vals: np.ndarray,
     pad_abs: float,
-    force_include: Tuple[float, float] | None = None,
-    clamp_low: float | None = None,
-    clamp_high: float | None = None,
-) -> Tuple[float, float] | None:
+    force_include: Optional[Tuple[float, float]] = None,
+    clamp_low: Optional[float] = None,
+    clamp_high: Optional[float] = None,
+) -> Optional[Tuple[float, float]]:
     """
     Calculate Y-axis domain that uses chart space efficiently while including key thresholds.
 
@@ -493,27 +490,34 @@ def build_behavior_index(years: np.ndarray, pct_by_2035: float) -> np.ndarray:
     return clamp(idx, 0.0, None)
 
 
-def build_enrollment_index_constant(years: np.ndarray, pct_level: float) -> np.ndarray:
+def build_enrollment_index_ramped(years: np.ndarray, pct_by_2035: float) -> np.ndarray:
     """
     Build UW enrollment trend index (freshman class size / admissions policy).
 
-    This captures UW-specific policy decisions affecting class size:
-    - Budget-driven enrollment caps
-    - Changes in admission selectivity
-    - Program additions or cuts
+    v4.4 FIX: Changed from constant to ramped implementation to preserve 2025=100.
+    
+    Previous (v4.3) implementation applied the multiplier to ALL years including 2025,
+    which broke the "2025 = 100" anchoring contract. A -10% setting would cause
+    Demand_Index(2025) = 90, DSCR(2025) < base_dscr, confusing the baseline.
 
-    Implemented as a constant level multiplier (not ramped) because policy
-    changes typically take effect immediately rather than phasing in.
+    Now uses the same ramping approach as other "by 2035" levers:
+    - 2025: always 100 (base year anchor preserved)
+    - 2035: reaches target (e.g., 90 for -10%)
+    - After 2035: holds at target level
+
+    This models enrollment policy changes as phasing in over time, which is
+    realistic (budget cuts, admission changes rarely happen overnight).
 
     Args:
         years: Array of years
-        pct_level: Percent change from baseline (e.g., -0.10 for -10%)
+        pct_by_2035: Percent change by 2035 (e.g., -0.10 for -10%)
 
     Returns:
         Array of index values (base year = 100)
     """
-    idx = BASE_INDEX * (1.0 + pct_level)
-    return np.full(len(years), clamp(idx, 0.0, None), dtype=float)
+    prog = linear_progress(years, BASE_YEAR, 2035)
+    idx = BASE_INDEX * (1.0 + pct_by_2035 * prog)
+    return clamp(idx, 0.0, None)
 
 
 def compute_demand_index(
@@ -580,6 +584,17 @@ def compute_capacity_cost_factors(
 
     The "build it and they will come" assumption is dangerous for bond covenants.
 
+    v4.4 FIX: Debt factor now only INCREASES, never decreases.
+    
+    Rationale: Closing/mothballing buildings does NOT reduce debt service.
+    The bonds are already issued; payments continue regardless of whether
+    the building is in use. Debt reduction requires explicit refinancing,
+    defeasance, or bond retirement, which are separate policy actions
+    not captured by simply reducing capacity.
+
+    Operating expenses CAN decrease with capacity (fewer buildings to maintain),
+    so expense_factor is allowed to go below 1.0.
+
     Args:
         capacity_index: Capacity index over time, where 100 = base year CAPACITY
             (not occupancy). When haggett_net_beds=0, this equals 100.
@@ -587,10 +602,11 @@ def compute_capacity_cost_factors(
         expense_sensitivity: What fraction of capacity change affects operating costs.
             Default 0.50 means 10% more capacity → 5% more operating costs.
             Rationale: Some costs are fixed (admin), some scale with capacity.
-        debt_sensitivity: How much debt service scales with capacity change.
+        debt_sensitivity: How much debt service scales with capacity INCREASES.
             Default 1.50 means 10% more capacity → 15% more debt service.
             Rationale: Construction is capital-intensive; new buildings carry
             disproportionate debt load relative to their bed count.
+            NOTE: Capacity decreases do NOT reduce debt (bonds already issued).
 
     Returns:
         Tuple of (expense_factor, debt_factor) arrays, where 1.0 = no change
@@ -599,13 +615,16 @@ def compute_capacity_cost_factors(
     # capacity_index = 110 means 10% more capacity → delta = 0.10
     capacity_delta = (capacity_index - BASE_INDEX) / BASE_INDEX
 
-    # Scale factors (1.0 at base capacity)
+    # Expense factor: can increase OR decrease with capacity
+    # (Closing buildings does reduce maintenance/utilities)
     expense_factor = 1.0 + (capacity_delta * expense_sensitivity)
-    debt_factor = 1.0 + (capacity_delta * debt_sensitivity)
+    expense_factor = np.maximum(expense_factor, 0.1)  # Floor to prevent negative
 
-    # Ensure factors don't go negative (e.g., if capacity drops dramatically)
-    expense_factor = np.maximum(expense_factor, 0.1)
-    debt_factor = np.maximum(debt_factor, 0.1)
+    # Debt factor: can ONLY INCREASE, never decrease
+    # (Closing buildings does NOT reduce debt service - bonds are already issued)
+    # v4.4 FIX: Use max(0, delta) so negative capacity changes don't reduce debt
+    positive_delta = np.maximum(capacity_delta, 0.0)
+    debt_factor = 1.0 + (positive_delta * debt_sensitivity)
 
     return expense_factor, debt_factor
 
@@ -717,7 +736,7 @@ def get_debt_peak_window(
     debt_shape: str,
     custom_peak_year: int,
     custom_peak_multiplier: float,
-) -> Tuple[int, int] | None:
+) -> Optional[Tuple[int, int]]:
     """
     Identify debt peak pressure window for chart shading (UI helper only).
 
@@ -797,7 +816,7 @@ def run_model(
     # Build demand components
     national_index = build_national_index(years, national_trend_pct_by_2035)
     behavior_index = build_behavior_index(years, behavior_headwind_pct_by_2035)
-    enrollment_index = build_enrollment_index_constant(years, uw_enrollment_trend_pct)
+    enrollment_index = build_enrollment_index_ramped(years, uw_enrollment_trend_pct)
 
     # Compute composite demand index
     # Code Review Note (v4.2): Extracted to separate function for clarity
@@ -953,7 +972,7 @@ def value_at_year(
     return float(row.iloc[0][col])
 
 
-def first_breach_year(df: pd.DataFrame) -> int | None:
+def first_breach_year(df: pd.DataFrame) -> Optional[int]:
     """Find the first year where covenant is breached, or None if never breached."""
     future = df[df["year"] >= BASE_YEAR].copy()
     breach = future[future["Covenant_Breach"]]
@@ -962,7 +981,7 @@ def first_breach_year(df: pd.DataFrame) -> int | None:
     return int(breach.iloc[0]["year"])
 
 
-def worst_year_by(df: pd.DataFrame, col: str) -> int | None:
+def worst_year_by(df: pd.DataFrame, col: str) -> Optional[int]:
     """Find the year with the minimum value of a column."""
     s = df[["year", col]].copy()
     s = s[np.isfinite(s[col])]
@@ -1073,7 +1092,7 @@ def x_year(title: str = "Year") -> alt.X:
     )
 
 
-def peak_band_layer(peak_window: Tuple[int, int] | None) -> alt.Chart | None:
+def peak_band_layer(peak_window: Optional[Tuple[int, int]]) -> Optional[alt.Chart]:
     """
     Create debt-peak shading band for charts.
 
@@ -1128,17 +1147,17 @@ adequate **coverage** for our debt payments.
 
 **What is "coverage" (DSCR)?**
 DSCR stands for **Debt Service Coverage Ratio**. Think of it as:
-> "For every dollar we owe in debt payments, how many dollars do we have available?"
+> "For every unit we owe in debt payments, how many units do we have available?"
 
-The bond requires us to keep this ratio above **{required_dscr:.2f}** (meaning we have ${required_dscr:.2f}
-available for every $1.00 we owe).
+The bond requires us to keep this ratio above **{required_dscr:.2f}** (meaning we need {required_dscr:.2f}
+units of cash flow for every 1.00 unit of debt service).
 
 **Why do we need a safety buffer?**
 Because our income depends on enrollment, pricing, and costs, all of which can change. If coverage
 drops below the minimum, it's a "covenant breach" which triggers remediation requirements.
 
 **About the numbers in this model:**
-All values are shown as **indices** (2025 = 100) rather than dollar amounts. This focuses attention
+All values are shown as **indices** (2025 = 100) rather than currency amounts. This focuses attention
 on trends and structural relationships rather than specific budget numbers.
         """.strip()
     )
@@ -1185,7 +1204,7 @@ if "uw_enrollment_trend_pct" not in st.session_state:
 if "focus_year" not in st.session_state:
     st.session_state["focus_year"] = 2035
 
-# v4.2 addition: capacity cost sensitivity parameters
+# v4.3 addition: capacity cost sensitivity parameters
 if "capacity_expense_sensitivity_pct" not in st.session_state:
     st.session_state["capacity_expense_sensitivity_pct"] = 50
 
@@ -1264,7 +1283,7 @@ with st.sidebar:
     )
 
     st.slider(
-        "UW Class Size Change",
+        "UW Class Size Change (by 2035)",
         min_value=-20,
         max_value=10,
         step=1,
@@ -1274,7 +1293,8 @@ with st.sidebar:
             "Changes to freshman class size from UW policy decisions "
             "(budget cuts, admission selectivity, program changes).\n\n"
             "This is separate from demographic trends and housing preferences.\n\n"
-            "Example: -10% means 10% fewer freshmen admitted across all years."
+            "Phases in gradually from 2025 to 2035, then holds steady.\n\n"
+            "Example: -10% means class size shrinks to 90% of baseline by 2035."
         ),
     )
 
@@ -1315,12 +1335,13 @@ with st.sidebar:
         key="haggett_net_beds",
         help=(
             "Net change in housing capacity from construction projects.\n\n"
-            "**Important:** Adding beds increases BOTH costs and debt service, "
+            "**Important:** Adding beds increases BOTH operating costs and debt service, "
             "regardless of whether students fill those beds. This models the "
             "'build it and they may not come' risk.\n\n"
             "• Positive values: New construction (adds costs + debt)\n"
-            "• Negative values: Closing/demolishing buildings (reduces costs)\n"
-            "• Revenue only increases if students actually fill the beds"
+            "• Negative values: Closing buildings (reduces operating costs only)\n"
+            "• **Note:** Closing buildings does NOT reduce debt service, "
+            "since bonds are already issued. Debt reduction requires refinancing."
         ),
     )
 
@@ -1462,7 +1483,8 @@ with st.sidebar:
         )
 
     with st.expander("Reference: Bond Requirements", expanded=False):
-        st.write(f"**Current Coverage Ratio (2022 actual):** {base_dscr:.2f}")
+        st.write(f"**DSCR Anchor (latest audited, 2022):** {base_dscr:.2f}")
+        st.caption("This is the most recent audited DSCR, used as the baseline anchor for projections.")
         st.write(f"**Minimum Required (covenant):** {required_dscr:.2f}")
         st.write(
             f"**Current Safety Cushion:** {base_dscr - required_dscr:.2f} "
@@ -1494,7 +1516,7 @@ params = {
         st.session_state.get("custom_peak_multiplier", 1.20)
     ),
     "custom_peak_year": int(st.session_state.get("custom_peak_year", 2030)),
-    # v4.2 addition: capacity cost sensitivity
+    # v4.3 addition: capacity cost sensitivity
     "capacity_expense_sensitivity": float(
         st.session_state.get("capacity_expense_sensitivity_pct", 50)
     ) / 100.0,
@@ -1524,9 +1546,6 @@ headroom_focus = value_at_year(df, focus_year, "Headroom_Above_Min_DSCR", defaul
 
 # Worst-year values
 headroom_min = float(np.nanmin(df["Headroom_Above_Min_DSCR"].to_numpy(dtype=float)))
-
-dscr_ok_focus = bool(np.isfinite(dscr_focus) and dscr_focus >= required_dscr)
-headroom_ok_focus = bool(np.isfinite(headroom_focus) and headroom_focus >= 0.0)
 
 # =============================================================================
 # COMPLIANCE BANNER
@@ -1673,10 +1692,10 @@ with tabs[0]:
         st.line_chart(occ_df.set_index("year"))
 
     st.caption(
-        "**Beds Filled**: Students housed relative to today (100 = current occupancy). "
-        "**Bed Capacity**: Physical beds relative to today (100 = current capacity). "
-        "When Beds Filled is below Capacity, you have empty beds. "
-        "Adding capacity without filling it increases costs without revenue."
+        "Both lines are indexed to their own 2025 baselines (100 = today). "
+        "**Beds Filled** shows occupancy trend relative to current students housed. "
+        "**Bed Capacity** shows capacity trend relative to current beds available. "
+        "When Capacity grows faster than Beds Filled, empty capacity increases relative to today."
     )
 
     # -------------------------------------------------------------------------
@@ -2000,8 +2019,8 @@ with tabs[1]:
         "Demographic_Index",
         "Demand_Index",
         "Capacity_Index",
-        "Expense_Cap_Factor",  # v4.2 addition
-        "Debt_Cap_Factor",     # v4.2 addition
+        "Expense_Cap_Factor",  # v4.3 addition
+        "Debt_Cap_Factor",     # v4.3 addition
         "Occupancy_Index",
         "Revenue_Index",
         "Expense_Index",
@@ -2023,8 +2042,8 @@ with tabs[1]:
         "Demographic_Index": "Blended Demographic Index",
         "Demand_Index": "Total Demand Index",
         "Capacity_Index": "Capacity Index",
-        "Expense_Cap_Factor": "Capacity→Expense Factor",  # v4.2 addition
-        "Debt_Cap_Factor": "Capacity→Debt Factor",        # v4.2 addition
+        "Expense_Cap_Factor": "Capacity→Expense Factor",  # v4.3 addition
+        "Debt_Cap_Factor": "Capacity→Debt Factor",        # v4.3 addition
         "Occupancy_Index": "Occupancy Index",
         "Revenue_Index": "Revenue Index",
         "Expense_Index": "Expense Index",
@@ -2052,8 +2071,8 @@ with tabs[1]:
             "Demographic_Index": 1,
             "Demand_Index": 1,
             "Capacity_Index": 1,
-            "Expense_Cap_Factor": 2,  # v4.2 addition
-            "Debt_Cap_Factor": 2,     # v4.2 addition
+            "Expense_Cap_Factor": 2,  # v4.3 addition
+            "Debt_Cap_Factor": 2,     # v4.3 addition
             "Occupancy_Index": 1,
             "Revenue_Index": 1,
             "Expense_Index": 1,
@@ -2113,7 +2132,7 @@ with tabs[1]:
 
 st.divider()
 st.caption(
-    "UW HFS Housing Structural Risk Model v4.3 | "
+    "UW HFS Housing Structural Risk Model v4.4 | "
     "Index-based projections for strategic planning | "
     "Questions? Contact HFS Finance"
 )
